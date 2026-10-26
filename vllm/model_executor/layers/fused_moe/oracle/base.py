@@ -262,9 +262,14 @@ def resolve_moe_experts(
     paths = experts_mapping.get(backend)
     if paths is None:
         raise ValueError(f"Unknown {name} MoE backend: {backend.value}")
-    return [
-        cast(type[mk.FusedMoEExperts], resolve_obj_by_qualname(path)) for path in paths
-    ]
+    experts: list[type[mk.FusedMoEExperts]] = []
+    for path in paths:
+        experts_cls = resolve_obj_by_qualname(path)
+        assert isinstance(experts_cls, type) and issubclass(
+            experts_cls, mk.FusedMoEExperts
+        ), f"{path!r} must resolve to a FusedMoEExperts subclass"
+        experts.append(experts_cls)
+    return experts
 
 
 def make_moe_kernel(
