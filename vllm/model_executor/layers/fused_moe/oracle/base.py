@@ -19,11 +19,14 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
     FusedMoEQuantConfig,
 )
+from vllm.utils.import_utils import resolve_obj_by_qualname
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
 
 logger = init_logger(__name__)
+
+MOE_EXPERTS_MODULE = "vllm.model_executor.layers.fused_moe.experts"
 
 # Sentinel for the per-call `activation_key` override: `None` is a legitimate
 # key (BF16 activations), so absence needs its own value. Same idiom as
@@ -43,6 +46,9 @@ class MoEKernelOracle(ABC, Generic[BackendT]):
 
     # Display name used by the shared selection helpers below.
     name: ClassVar[str] = "MoE"
+    priority_backends: list[BackendT] = []
+    backend_mapping: dict[MoEBackend, BackendT] = {}
+    experts_mapping: dict[BackendT, tuple[str, ...]] = {}
 
     def __init__(
         self,
@@ -64,29 +70,29 @@ class MoEKernelOracle(ABC, Generic[BackendT]):
         backends (e.g. `UnquantizedMoeBackend`, `Fp8MoeBackend`)."""
         raise NotImplementedError
 
-    def get_priority_backends(self, moe_config: FusedMoEConfig) -> list[BackendT]:
-        """Return platform-appropriate backends in priority order for
-        this `moe_config`."""
-        raise NotImplementedError
+    def get_priority_backends(self) -> list[BackendT]:
+        """Return platform-appropriate backends in priority order."""
+        return list(self.priority_backends)
 
     def backend_to_kernel_cls(
         self, backend: BackendT
     ) -> list[type[mk.FusedMoEExperts]]:
         """Map a backend enum value to its concrete `FusedMoEExperts`
         subclasses, in selection priority order."""
-        raise NotImplementedError
+        return resolve_moe_experts(backend, self.experts_mapping, self.name)
 
     def map_backend(self, runner_backend: MoEBackend) -> BackendT:
         """Map a user-facing `MoEBackend` (from the runner config) to
         this oracle's enum."""
-        raise NotImplementedError
+        backend = self.backend_mapping.get(runner_backend)
+        if backend is not None:
+            return backend
+        raise ValueError(
+            f"moe_backend='{runner_backend}' is not supported for {self.name} MoE. "
+            f"Expected one of {list(self.backend_mapping)}."
+        )
 
-    def select_backend(
-        self,
-        moe_config: FusedMoEConfig,
-        weight_key: "QuantKey | None" = None,
-        activation_key: "QuantKey | None" = None,
-    ) -> tuple[BackendT, type[mk.FusedMoEExperts] | None]:
+    def select_backend(self) -> tuple[BackendT, type[mk.FusedMoEExperts] | None]:
         """Primary entry point: choose the best supported backend for
         the given `moe_config`.
 
@@ -99,7 +105,29 @@ class MoEKernelOracle(ABC, Generic[BackendT]):
         per-oracle config object is the longer-term target tracked in
         the #37753 follow-up PRs.
         """
-        raise NotImplementedError
+        available_backends = self.get_priority_backends()
+
+        # Handle explicit moe_backend from user.
+        requested = self.moe_config.moe_backend
+        if requested != "auto":
+            return self.return_or_raise(self.map_backend(requested), available_backends)
+
+        # Select kernels in order of backend.
+        selection_logger = init_logger(type(self).__module__)
+        for backend in available_backends:
+            experts_cls, reason = self.try_backend(backend)
+            if experts_cls is not None:
+                selection_logger.info_once(
+                    self.make_log_backend(backend, available_backends)
+                )
+                return backend, experts_cls
+            selection_logger.debug_once(self.make_log_unsupported(backend, reason))
+
+        raise NotImplementedError(
+            f"No {self.name} MoE backend supports the deployment configuration "
+            f"(weight_key={self.weight_key}, activation_key={self.activation_key}). "
+            "Set `VLLM_LOGGING_LEVEL=DEBUG` to see per-backend unsupported reasons."
+        )
 
     def make_kernel(
         self,
@@ -224,6 +252,19 @@ class MoEKernelOracle(ABC, Generic[BackendT]):
             raise ValueError(self.make_log_unsupported(backend, reason))
         logger.info_once(self.make_log_backend(backend, available_backends))
         return backend, kernel_cls
+
+
+def resolve_moe_experts(
+    backend: BackendT,
+    experts_mapping: dict[BackendT, tuple[str, ...]],
+    name: str,
+) -> list[type[mk.FusedMoEExperts]]:
+    paths = experts_mapping.get(backend)
+    if paths is None:
+        raise ValueError(f"Unknown {name} MoE backend: {backend.value}")
+    return [
+        cast(type[mk.FusedMoEExperts], resolve_obj_by_qualname(path)) for path in paths
+    ]
 
 
 def make_moe_kernel(
