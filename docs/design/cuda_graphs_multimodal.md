@@ -73,7 +73,9 @@ class BudgetGraphMetadata:
 
 Budgets are auto-generated over the model-provided range of `get_encoder_cudagraph_budget_range()`: quarter-octave steps up to 1024 tokens, steps of 128 up to 2560 tokens, then 1/8-octave steps rounded up to a multiple of 128 (e.g., `[64, 80, ..., 1024, 1152, ..., 2560, 2816, 3072, 3456, 3840, 4224, 4608, 5120]`, 36 levels for the range `[64, 16384]` with the default maximum). The model-provided minimum and maximum are always included even when they do not fall on a grid point. The largest generated budget is `encoder_cudagraph_max_token_budget` in `CompilationConfig` (default 5120; `None` captures up to the model's largest budget), like the LLM's maximum capture size. The default balances graph memory against replay coverage; the point at which eager becomes faster depends on the model, batch shape, and hardware. Workloads that benefit from larger graphs can raise the maximum. Each batch replays at most one graph, the smallest budget that holds it; a larger batch runs eagerly in one forward. Budgets can also be explicitly specified by the user via `encoder_cudagraph_token_budgets` in `CompilationConfig`, which overrides both.
 
-The dense default table is affordable for every model because capture buffers are shared across budgets automatically, with no model opt-in: budgets are captured largest-first, the first capture of each (path, capture-axis) group provides one set of max-size input buffers and one max-size output buffer, and every later capture of the group records its graph into prefix views of them (the same pattern as decoder `input_ids[:num_tokens]`). At capture time the manager checks each probed buffer for prefix compatibility (same trailing dims and dtype, no more rows than the shared buffer; scalars are shared wholesale) and copies it into the shared buffer; buffers that do not fit this pattern keep their own per-budget allocation, so models need no code changes. Buffer memory therefore stays at ~1× the largest budget instead of scaling with the sum of all budgets.
+The dense default table is affordable for every model because capture buffers are shared across budgets automatically, with no model opt-in: budgets are captured largest-first, the first capture of each (path, capture-axis) group provides one set of max-size input buffers and one max-size output buffer, and every later capture of the group records its graph into prefix views of them (the same pattern as decoder `input_ids[:num_tokens]`). At capture time the manager checks each probed buffer for prefix compatibility (same trailing dims and dtype, no more rows than the shared buffer) and copies it into the shared buffer; buffers that do not fit this pattern, including 0-dim scalars, keep their own per-budget allocation, so models need no code changes. Buffer memory therefore stays at ~1× the largest budget instead of scaling with the sum of all budgets.
+
+Because later captures overwrite a shared buffer, its capture-time contents may belong to another budget. Replay must therefore provide every shared buffer (the manager raises if one is missing), and a custom `padding_logics` entry must write its whole destination buffer.
 
 Each entry in `EncoderCudaGraphConfig.paths` defines an independently captured encoder path. A path can provide its own minimum token budget and opt into zero-token batches; the manager generates and stores a separate budget graph set for every configured path.
 
@@ -108,9 +110,9 @@ When a batch of images arrives, the manager replays the **smallest** budget that
 For each graph replay:
 
 1. Call `prepare_encoder_cudagraph_replay_buffers()` to compute buffer values (including `pixel_values` and precomputed metadata) from actual batch inputs.
-2. Zero the pre-allocated `input_buffers`, then slice-copy the replay values into them.
+2. Slice-copy the replay values into the pre-allocated `input_buffers`. By default the tail is zero-filled, except for cumulative offsets (`cu_seqlens`, `cu_window_seqlens`), which repeat their last value so padded sequences are empty. Models can override this per buffer with `EncoderCudaGraphConfig.padding_logics`.
 3. Replay the CUDA Graph.
-4. Clone outputs from `output_buffer` (cloning is necessary since the buffer is reused across replays).
+4. Clone outputs from `output_buffer` (cloning is necessary since the buffer is reused across replays of every budget on the path).
 
 ### ViT DP Mode Support
 
@@ -130,17 +132,23 @@ Following <https://github.com/vllm-project/vllm/pull/35963> (ViT full CUDA graph
 Models opt-in to encoder CUDA Graphs by implementing the [SupportsEncoderCudaGraph][vllm.model_executor.models.interfaces.SupportsEncoderCudaGraph] protocol. This protocol encapsulates all model-specific logic so that the manager remains model-agnostic. The protocol defines the following methods:
 
 * `get_encoder_cudagraph_config()` — returns static configuration (supported modalities, buffer keys, output hidden size, padding logics, max frames per video).
-* `get_encoder_cudagraph_budget_range(vllm_config)` — returns `(min_budget, max_budget)` for auto-inference of token budgets.
+* `get_encoder_cudagraph_budget_range(vllm_config)` — returns `(min_budget, max_budget)` for auto-inference of token budgets. The default is `(64, min(max_num_batched_tokens, max_model_len))`.
 * `get_encoder_cudagraph_item_specs(mm_kwargs)` — returns `list[EncoderItemSpec]` describing each item with its input size, total output token count (`output_tokens`), and per-path token counts (`path_output_tokens`) for multi-path models.
 * `select_encoder_cudagraph_items(mm_kwargs, indices)` — extracts a sub-batch of items by index, used during dispatch and DP sharding.
 * `prepare_encoder_cudagraph_capture_inputs(..., path="default")` — creates dummy inputs for graph capture. The `path` parameter (`"global"` or `"local"`) tells the model which path to generate dummy inputs for. Returns `EncoderCudaGraphCaptureInputs` with a single `values: dict[str, torch.Tensor]` that contains all buffers to be recorded into the graph.
 * `prepare_encoder_cudagraph_replay_buffers(mm_kwargs, max_batch_size, max_frames_per_batch, path="default")` — computes buffer values from actual batch inputs. The `path` parameter selects which modality keys to extract from `mm_kwargs`. Returns `EncoderCudaGraphReplayBuffers` with a `values` dict whose keys match the captured graph's `input_buffers.keys()`.
 * `encoder_cudagraph_forward(inputs: dict[str, torch.Tensor], path="default")` — forward pass accepting only fixed-shaped input tensors (the captured `values` dict). Called during both capture and replay. The `path` parameter dispatches to the correct encoder sub-module (e.g., global vs. local path for DeepSeek-OCR).
 * `encoder_eager_forward(mm_kwargs, path="default")` — fallback eager forward when no graph fits. When `path` is `"global"` or `"local"`, runs only that encoder path without graph capture.
-* `postprocess_encoder_output(outputs, ...)` — post-process encoder outputs keyed by path name, enabling multi-path models to assemble their path-specific features into the final per-item embedding.
+* `postprocess_encoder_output(outputs, ...)` — post-process encoder outputs keyed by path name, enabling multi-path models to assemble their path-specific features into the final per-item embedding. With `clone=True`, the per-item results must not be views of `outputs`, since the next replay overwrites the shared output buffer.
 
 !!! note
     The `SupportsEncoderCudaGraph` protocol is designed to be model-agnostic. New vision encoder models can opt-in by implementing the protocol methods without modifying the manager.
+
+    Models whose vision tower follows the Qwen2-VL tower interface (listed in the mixin docstring) do not implement the protocol from scratch:
+
+    1. Inherit `Qwen2VLEncoderCudaGraphMixin` from `vllm/model_executor/models/encoder_cudagraph_utils.py`.
+    2. Implement `get_encoder_cudagraph_config()`.
+    3. Override a protocol method only where the model really differs (e.g. Qwen2.5-VL's window attention at capture).
 
 ## Configuration
 

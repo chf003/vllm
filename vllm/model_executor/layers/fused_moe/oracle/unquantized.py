@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from enum import Enum
-from typing import TYPE_CHECKING
 
 import torch
 
@@ -28,9 +27,6 @@ from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import round_up
 
-if TYPE_CHECKING:
-    from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
-
 logger = init_logger(__name__)
 
 
@@ -45,6 +41,8 @@ class UnquantizedMoeBackend(Enum):
     XPU = "XPU"
     TPU = "TPU"
     OOT = "OOT"
+    # No compute backend: requantization sources only dequantize weights.
+    NONE = "NONE"
 
 
 def _get_priority_backends(moe_config: FusedMoEConfig) -> list[UnquantizedMoeBackend]:
@@ -97,10 +95,19 @@ def _get_priority_backends(moe_config: FusedMoEConfig) -> list[UnquantizedMoeBac
         # XPUExperts does not support batch invariance; TRITON is kept as a
         # fallback so VLLM_BATCH_INVARIANT=1 still resolves to a valid
         # (batch-invariant) backend on XPU.
-        _AVAILABLE_BACKENDS = [
-            UnquantizedMoeBackend.XPU,
-            UnquantizedMoeBackend.TRITON,
-        ]
+        #
+        # XPUExperts cannot consume the batched activation format, so prefer
+        # BATCHED_TRITON when the dispatch emits it.
+        if moe_config.use_batched_activation_format:
+            _AVAILABLE_BACKENDS = [
+                UnquantizedMoeBackend.BATCHED_TRITON,
+                UnquantizedMoeBackend.XPU,
+            ]
+        else:
+            _AVAILABLE_BACKENDS = [
+                UnquantizedMoeBackend.XPU,
+                UnquantizedMoeBackend.TRITON,
+            ]
     elif current_platform.is_cpu():
         _AVAILABLE_BACKENDS = [UnquantizedMoeBackend.CPU]
     return _AVAILABLE_BACKENDS
@@ -224,7 +231,14 @@ def select_unquantized_moe_backend(
 ) -> tuple[UnquantizedMoeBackend, type[mk.FusedMoEExperts] | None]:
     """Select the primary Unquantized MoE backend.
     Note: Shape-specific fallbacks may still occur at runtime.
+    Returns `NONE` and a placeholder experts class when an online method
+    replaces the unquantized one.
     """
+    # TODO: migrate to oracle base method.
+    source = UnquantizedMoEKernelOracle.maybe_skip_for_requantization_source()
+    if source is not None:
+        return source
+
     if current_platform.is_tpu():
         return UnquantizedMoeBackend.TPU, None
 
@@ -257,6 +271,16 @@ def select_unquantized_moe_backend(
                 "(TrtLlmBf16LoRAExperts)."
             )
             return UnquantizedMoeBackend.FLASHINFER_TRTLLM, TrtLlmBf16LoRAExperts
+
+        # On XPU, TRITON stays the fallback (e.g. for batch invariance) and is
+        # forced by --moe-backend triton.
+        if current_platform.is_xpu() and moe_config.moe_backend != "triton":
+            backend = UnquantizedMoeBackend.XPU
+            oracle = UnquantizedMoEKernelOracle(moe_config, None, None)
+            kernel_cls, _ = oracle.try_backend(backend)
+            if kernel_cls is not None:
+                logger.debug_once(oracle.make_log_backend(backend, is_lora=True))
+                return backend, kernel_cls
 
         return UnquantizedMoEKernelOracle(moe_config, None, None).return_or_raise(
             UnquantizedMoeBackend.TRITON,
@@ -305,7 +329,7 @@ def select_unquantized_moe_backend(
             backend = UnquantizedMoeBackend.AITER
             kernel_cls, rejected = oracle.try_backend(backend)
             if kernel_cls is not None:
-                logger.info_once(oracle.make_log_backend(backend, AVAILABLE_BACKENDS))
+                logger.debug_once(oracle.make_log_backend(backend, AVAILABLE_BACKENDS))
                 return backend, kernel_cls
             # AITER was explicitly requested but does not support this
             # deployment configuration (e.g. a non-gated MoE activation,
@@ -332,7 +356,7 @@ def select_unquantized_moe_backend(
     for backend in AVAILABLE_BACKENDS:
         kernel_cls, _ = oracle.try_backend(backend)
         if kernel_cls is not None:
-            logger.info_once(oracle.make_log_backend(backend, AVAILABLE_BACKENDS))
+            logger.debug_once(oracle.make_log_backend(backend, AVAILABLE_BACKENDS))
             return backend, kernel_cls
 
     raise NotImplementedError(
@@ -343,9 +367,9 @@ def select_unquantized_moe_backend(
 def aiter_moe_intermediate_alignment(intermediate: int) -> int:
     """Intermediate-size alignment required by AITER's CK 2stages MoE kernel.
 
-    AITER dispatches on ``inter_dim <= 192``: below the threshold both stages
+    AITER dispatches on `inter_dim <= 192`: below the threshold both stages
     use 64-wide tiles, above it at least one stage uses a 128-wide tile, and
-    CK's ``IsSupportedArgument`` rejects a size not divisible by that width.
+    CK's `IsSupportedArgument` rejects a size not divisible by that width.
     """
     return 64 if intermediate <= 192 else 128
 
@@ -506,37 +530,36 @@ class UnquantizedMoEKernelOracle(MoEKernelOracle[UnquantizedMoeBackend]):
     instantiating and calling this class is bit-identical to calling
     the standalone functions. Follow-up PRs may move logic from the
     module-level functions into these methods.
+
+    Priority and selection methods read `self.moe_config`.
     """
 
     name = "Unquantized"
+    placeholder_backend = UnquantizedMoeBackend.NONE
 
     def backend_enum_cls(self) -> type[UnquantizedMoeBackend]:
         return UnquantizedMoeBackend
 
-    def get_priority_backends(
-        self, moe_config: FusedMoEConfig
-    ) -> list[UnquantizedMoeBackend]:
-        return _get_priority_backends(moe_config)
+    def get_priority_backends(self) -> list[UnquantizedMoeBackend]:
+        return _get_priority_backends(self.moe_config)
 
     def backend_to_kernel_cls(
         self, backend: UnquantizedMoeBackend
     ) -> list[type[mk.FusedMoEExperts]]:
         return backend_to_kernel_cls(backend)
 
-    def map_backend(self, runner_backend: MoEBackend) -> UnquantizedMoeBackend:
+    @classmethod
+    def map_backend(cls, runner_backend: MoEBackend) -> UnquantizedMoeBackend:
         return map_unquantized_backend(runner_backend)
 
     def select_backend(
         self,
-        moe_config: FusedMoEConfig,
-        weight_key: "QuantKey | None" = None,
-        activation_key: "QuantKey | None" = None,
     ) -> tuple[UnquantizedMoeBackend, type[mk.FusedMoEExperts] | None]:
-        assert weight_key is None and activation_key is None, (
+        assert self.weight_key is None and self.activation_key is None, (
             "Weights and activations will never be quantized for "
             "UnquantizedMoEKernelOracle"
         )
-        return select_unquantized_moe_backend(moe_config)
+        return select_unquantized_moe_backend(self.moe_config)
 
     def convert_to_kernel_format(
         self,

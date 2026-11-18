@@ -28,6 +28,7 @@ from vllm.utils.torch_utils import current_stream
 from vllm.v1.worker.encoder_cudagraph_defs import (
     ENCODER_CUDAGRAPH_AXIS_KEYS_KWARG,
     EncoderCudaGraphConfig,
+    EncoderCudaGraphPaddingLogic,
     EncoderItemSpec,
 )
 
@@ -43,8 +44,11 @@ _LINEAR_GRID_END = 2560
 # Warn when capture axes multiply the captured graph count past this point.
 _CAPTURE_GRAPH_COUNT_WARNING_THRESHOLD = 64
 
+# Padding repeats the last offset so padded sequences are empty.
+_CUMULATIVE_BUFFER_KEYS = frozenset({"cu_seqlens", "cu_window_seqlens"})
 
-@dataclass
+
+@dataclass(slots=True)
 class BudgetGraphMetadata:
     """Metadata for a single budget graph.
 
@@ -60,8 +64,9 @@ class BudgetGraphMetadata:
     graph: torch.cuda.CUDAGraph
     # Buffers recorded into the CUDA graph (e.g. embeddings, sequence metadata).
     # Before replay the manager updates these in-place. By default buffers are
-    # zeroed before slice-copying the actual values; model-specific padding
-    # behavior is provided by EncoderCudaGraphConfig.padding_logics.
+    # zeroed before slice-copying the actual values, and cumulative buffers
+    # repeat their last value; model-specific padding behavior is provided by
+    # EncoderCudaGraphConfig.padding_logics.
     input_buffers: dict[str, torch.Tensor]
     # Output written by graph, read after replay
     output_buffer: torch.Tensor
@@ -204,6 +209,9 @@ class EncoderCudaGraphManager:
         self._shared_output_buffers: dict[
             tuple[str, CaptureAxisKeys], torch.Tensor
         ] = {}
+        # Input keys whose shared buffer smaller budgets view. Other budgets'
+        # captures overwrite it, so replay must refill these keys.
+        self._shared_input_keys: dict[tuple[str, CaptureAxisKeys], set[str]] = {}
         self.graph_hits = 0
         self.graph_misses = 0
         self.log_stats_interval = 100
@@ -252,7 +260,7 @@ class EncoderCudaGraphManager:
         Quarter-octave steps up to 1024 tokens, steps of 128 up to 2560, then
         1/8-octave steps (rounded up to 128), so a replay pads at most ~25%
         below 1024, ~12% up to 2560 and ~9% above. Capture buffers are shared
-        across budgets (see ``_capture_budget_graph``), so extra graphs cost
+        across budgets (see `_capture_budget_graph`), so extra graphs cost
         no buffer memory. Batches above the largest budget run eagerly.
         """
         if cap is not None:
@@ -293,6 +301,18 @@ class EncoderCudaGraphManager:
         """Check if a modality is supported by this manager."""
         return modality in self.config.modalities
 
+    def supports_batch(self, modality: str, mm_kwargs: dict[str, Any]) -> bool:
+        """Check if a batch can run through the captured encoder graphs.
+
+        Precomputed embeddings (`<modality>_embeds`) do not run the encoder,
+        so the caller must send them to `embed_multimodal` instead. A batch
+        never mixes them with pixel inputs: `group_and_batch_mm_kwargs` only
+        batches items that have the same keys.
+        """
+        return (
+            self.supports_modality(modality) and f"{modality}_embeds" not in mm_kwargs
+        )
+
     def is_captured(self) -> bool:
         """Return whether a CUDA graph pool is active."""
         return self.graph_pool is not None
@@ -304,6 +324,7 @@ class EncoderCudaGraphManager:
         self.graph_pool = None
         self._shared_input_buffers.clear()
         self._shared_output_buffers.clear()
+        self._shared_input_keys.clear()
 
     def capture(self, graph_pool: Any):
         """Capture CUDA graphs for every configured path and token budget."""
@@ -369,19 +390,14 @@ class EncoderCudaGraphManager:
 
         For each probe buffer that is a row-prefix of its shared counterpart
         (same trailing dims and dtype, no more rows), copy the probe contents
-        into the shared buffer and return the prefix view instead. 0-dim
-        buffers with matching dtype are shared wholesale. Anything else
-        keeps its own per-budget allocation.
+        into the shared buffer and return the prefix view instead. Anything
+        else, including 0-dim buffers (which hold per-budget values and save
+        no memory when shared), keeps its own per-budget allocation.
         """
         values = dict(probe)
         for key, buf in probe.items():
             full = shared.get(key)
-            if full is None:
-                continue
-            if buf.ndim == 0:
-                if full.ndim == 0 and full.dtype == buf.dtype:
-                    full.copy_(buf)
-                    values[key] = full
+            if full is None or buf.ndim == 0:
                 continue
             if (
                 full.ndim == buf.ndim
@@ -436,6 +452,11 @@ class EncoderCudaGraphManager:
             self._shared_input_buffers[share_key] = values
         else:
             values = self._share_prefix_compatible(capture_inputs.values, shared)
+            self._shared_input_keys.setdefault(share_key, set()).update(
+                key
+                for key, buf in values.items()
+                if buf is not capture_inputs.values[key]
+            )
 
         with torch.inference_mode():
             output = self.model.encoder_cudagraph_forward({**values}, path=path)
@@ -521,6 +542,44 @@ class EncoderCudaGraphManager:
         dst.zero_()
         dst[: src.shape[0]].copy_(src)
 
+    @staticmethod
+    def _replay_exceeds_capture(
+        input_buffers: dict[str, torch.Tensor],
+        replay_values: dict[str, torch.Tensor | None],
+    ) -> bool:
+        """Return True when any replay tensor does not fit its capture buffer.
+
+        Capture buffers have a fixed leading dimension. Copying a longer
+        replay tensor raises in the padded copy path; callers must fall
+        back to eager execution instead.
+        """
+        for key, buf in input_buffers.items():
+            src = replay_values.get(key)
+            if src is not None and src.ndim > 0 and src.shape[0] > buf.shape[0]:
+                return True
+        return False
+
+    @staticmethod
+    def _copy_cumulative_buffer(
+        dst: torch.Tensor,
+        src: torch.Tensor,
+    ) -> None:
+        n = src.shape[0]
+        dst[:n].copy_(src)
+        dst[n:] = src[-1]
+
+    @classmethod
+    def _get_padding_logic(
+        cls,
+        config: EncoderCudaGraphConfig,
+        key: str,
+    ) -> EncoderCudaGraphPaddingLogic:
+        if key in config.padding_logics:
+            return config.padding_logics[key]
+        if key in _CUMULATIVE_BUFFER_KEYS:
+            return cls._copy_cumulative_buffer
+        return cls._copy_padded_buffer
+
     def _run_budget_graph(
         self,
         mm_kwargs: dict[str, Any],
@@ -537,7 +596,8 @@ class EncoderCudaGraphManager:
             axis_keys: Resolved capture-axis keys for this batch.
 
         Returns:
-            Encoder outputs, or None if graph not captured.
+            Encoder outputs, or None if graph not captured or replay tensors
+            exceed the captured buffer capacity.
 
         """
         graph_set = self._get_graph_set(path)
@@ -559,18 +619,26 @@ class EncoderCudaGraphManager:
             path,
         )
 
+        if self._replay_exceeds_capture(graph_meta.input_buffers, replay.values):
+            self.graph_misses += num_items
+            return None
+
         # Copy replay values into the buffers recorded for this path.
+        shared_keys = self._shared_input_keys.get((path, graph_meta.axis_keys), ())
         for key, buf in graph_meta.input_buffers.items():
             src = replay.values.get(key)
             if src is None:
+                if key in shared_keys:
+                    raise RuntimeError(
+                        f"Encoder CUDA graph buffer {key!r} is shared across "
+                        "token budgets, so its capture-time contents may come "
+                        "from another budget; replay must provide its values."
+                    )
                 continue
             if src.ndim == 0:
                 buf.copy_(src)
             else:
-                padding_logic = self.config.padding_logics.get(
-                    key, self._copy_padded_buffer
-                )
-                padding_logic(buf, src)
+                self._get_padding_logic(self.config, key)(buf, src)
 
         graph_meta.graph.replay()
 
@@ -625,8 +693,13 @@ class EncoderCudaGraphManager:
                     path=path,
                     axis_keys=axis_keys,
                 )
-                assert graph_output is not None
-                output = graph_output
+                if graph_output is None:
+                    with torch.inference_mode():
+                        output = self.model.encoder_eager_forward(
+                            batch_mm_kwargs, path=path
+                        )
+                else:
+                    output = graph_output
             graph_outputs[path] = output
 
         if all_eager:

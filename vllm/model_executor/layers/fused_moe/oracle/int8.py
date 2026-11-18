@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Mapping
 from enum import Enum
+from types import MappingProxyType
 from typing import Any
 
 import torch
@@ -16,8 +18,10 @@ from vllm.model_executor.layers.fused_moe.config import (
     int8_w8a16_moe_quant_config,
 )
 from vllm.model_executor.layers.fused_moe.oracle.base import (
+    MOE_EXPERTS_MODULE,
     MoEKernelOracle,
     make_moe_kernel,
+    resolve_moe_experts,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
@@ -33,82 +37,73 @@ class Int8MoeBackend(Enum):
     TRITON = "TRITON"
     HUMMING = "HUMMING"
     CPU = "CPU"
+    # No compute backend: requantization sources only dequantize weights.
+    NONE = "NONE"
 
 
 def _get_priority_backends(
     moe_config: FusedMoEConfig,
 ) -> list[Int8MoeBackend]:
-    """Get available backends in priority order based on platform and config."""
-    return [
-        Int8MoeBackend.TRITON,
-        Int8MoeBackend.HUMMING,
-        Int8MoeBackend.CPU,
-    ]
+    """Legacy wrapper for INT8 backend priority selection."""
+    return Int8MoEKernelOracle(moe_config).get_priority_backends()
 
 
 def backend_to_kernel_cls(
     backend: Int8MoeBackend,
 ) -> list[type[mk.FusedMoEExperts]]:
-    if backend == Int8MoeBackend.TRITON:
-        from vllm.model_executor.layers.fused_moe.experts.triton_moe import (
-            TritonExperts,
-        )
-
-        return [TritonExperts]
-
-    elif backend == Int8MoeBackend.HUMMING:
-        from vllm.model_executor.layers.fused_moe.experts.fused_humming_moe import (
-            BatchedHummingGroupedExperts,
-            HummingGroupedExperts,
-            HummingIndexedExperts,
-        )
-
-        return [
-            BatchedHummingGroupedExperts,
-            HummingGroupedExperts,
-            HummingIndexedExperts,
-        ]
-    elif backend == Int8MoeBackend.CPU:
-        from vllm.model_executor.layers.fused_moe.experts.cpu_moe import (
-            ArmCPUExpertsInt8,
-            CPUExpertsInt8,
-            PowerCPUExpertsInt8,
-            ZenCPUExpertsInt8,
-        )
-
-        return [
-            ZenCPUExpertsInt8,
-            PowerCPUExpertsInt8,
-            ArmCPUExpertsInt8,
-            CPUExpertsInt8,
-        ]
-    else:
-        raise ValueError(f"Unknown Int8 MoE backend: {backend.value}")
-
-
-def map_int8_backend(runner_backend: MoEBackend) -> Int8MoeBackend:
-    """Map user's MoEBackend to Int8MoeBackend."""
-    mapping = {
-        "triton": Int8MoeBackend.TRITON,
-        "humming": Int8MoeBackend.HUMMING,
-    }
-    if backend := mapping.get(runner_backend):
-        return backend
-    raise ValueError(
-        f"moe_backend='{runner_backend}' is not supported for Int8 MoE. "
-        f"Expected one of {list(mapping.keys())}."
+    return resolve_moe_experts(
+        backend, Int8MoEKernelOracle.experts_mapping, Int8MoEKernelOracle.name
     )
 
 
+def map_int8_backend(runner_backend: MoEBackend) -> Int8MoeBackend:
+    return Int8MoEKernelOracle.map_backend(runner_backend)
+
+
 class Int8MoEKernelOracle(MoEKernelOracle[Int8MoeBackend]):
-    """INT8 MoE backend selection for one deployment configuration."""
+    """INT8 MoE backend selection for one deployment configuration.
+
+    Defaults to per-channel INT8 weights and per-token INT8 activations.
+    Pass `activation_key=None` for unquantized activations (W8A16).
+    """
 
     name = "Int8"
+    placeholder_backend = Int8MoeBackend.NONE
+    priority_backends = (
+        Int8MoeBackend.TRITON,
+        Int8MoeBackend.HUMMING,
+        Int8MoeBackend.CPU,
+    )
+    backend_mapping: Mapping[MoEBackend, Int8MoeBackend] = MappingProxyType(
+        {
+            "triton": Int8MoeBackend.TRITON,
+            "humming": Int8MoeBackend.HUMMING,
+        }
+    )
+    experts_mapping: Mapping[Int8MoeBackend, tuple[str, ...]] = MappingProxyType(
+        {
+            Int8MoeBackend.TRITON: (f"{MOE_EXPERTS_MODULE}.triton_moe.TritonExperts",),
+            Int8MoeBackend.HUMMING: (
+                f"{MOE_EXPERTS_MODULE}.fused_humming_moe.BatchedHummingGroupedExperts",
+                f"{MOE_EXPERTS_MODULE}.fused_humming_moe.HummingGroupedExperts",
+                f"{MOE_EXPERTS_MODULE}.fused_humming_moe.HummingIndexedExperts",
+            ),
+            Int8MoeBackend.CPU: (
+                f"{MOE_EXPERTS_MODULE}.cpu_moe.ZenCPUExpertsInt8",
+                f"{MOE_EXPERTS_MODULE}.cpu_moe.PowerCPUExpertsInt8",
+                f"{MOE_EXPERTS_MODULE}.cpu_moe.ArmCPUExpertsInt8",
+                f"{MOE_EXPERTS_MODULE}.cpu_moe.CPUExpertsInt8",
+            ),
+        }
+    )
 
-    def backend_to_kernel_cls(
-        self, backend: Int8MoeBackend
-    ) -> list[type[mk.FusedMoEExperts]]:
-        return backend_to_kernel_cls(backend)
+    def __init__(
+        self,
+        moe_config: FusedMoEConfig,
+        weight_key: QuantKey | None = kInt8StaticChannelSym,
+        activation_key: QuantKey | None = kInt8DynamicTokenSym,
+    ) -> None:
+        super().__init__(moe_config, weight_key, activation_key)
 
 
 def select_int8_moe_backend(
@@ -118,29 +113,13 @@ def select_int8_moe_backend(
 ) -> tuple[Int8MoeBackend, type[mk.FusedMoEExperts]]:
     """Select the primary Int8 MoE backend.
     Note: Shape-specific fallbacks may still occur at runtime.
+    Returns `NONE` and a placeholder experts class for requantization sources.
     """
-    AVAILABLE_BACKENDS = _get_priority_backends(config)
-
-    oracle = Int8MoEKernelOracle(config, weight_key, activation_key)
-
-    # Handle explicit moe_backend from user.
-    runner_backend = config.moe_backend
-    if runner_backend != "auto":
-        requested_backend = map_int8_backend(runner_backend)
-        return oracle.return_or_raise(requested_backend, AVAILABLE_BACKENDS)
-
-    # Select kernels in order of backend.
-    for backend in AVAILABLE_BACKENDS:
-        kernel_cls, _ = oracle.try_backend(backend)
-        if kernel_cls is not None:
-            logger.info_once(oracle.make_log_backend(backend, AVAILABLE_BACKENDS))
-            return backend, kernel_cls
-
-    raise NotImplementedError(
-        "No Int8 MoE backend supports the deployment configuration "
-        f"(weight_key={weight_key}, activation_key={activation_key}). "
-        "Set `VLLM_LOGGING_LEVEL=DEBUG` to see per-backend unsupported reasons."
-    )
+    backend, experts_cls = Int8MoEKernelOracle(
+        config, weight_key, activation_key
+    ).select_backend()
+    assert experts_cls is not None
+    return backend, experts_cls
 
 
 def make_int8_moe_quant_config(
@@ -152,6 +131,7 @@ def make_int8_moe_quant_config(
     w1_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
     per_act_token_quant: bool = False,
+    per_out_ch_quant: bool = False,
     layer: torch.nn.Module | None = None,
 ) -> FusedMoEQuantConfig:
     if (a1_scale is None) != (a2_scale is None):
@@ -174,6 +154,8 @@ def make_int8_moe_quant_config(
         )
 
     if scales_absent and not per_act_token_quant:
+        # The W8A16 kernels always index weight scales per output channel and
+        # ignore per_out_ch_quant, so it is not forwarded here.
         return int8_w8a16_moe_quant_config(
             w1_scale=w1_scale,
             w2_scale=w2_scale,
@@ -191,6 +173,7 @@ def make_int8_moe_quant_config(
         w1_bias=w1_bias,
         w2_bias=w2_bias,
         per_act_token_quant=per_act_token_quant,
+        per_out_ch_quant=per_out_ch_quant,
     )
 
 
